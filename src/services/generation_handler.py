@@ -87,9 +87,6 @@ class GenerationHandler:
 
     def _get_base_url(self) -> str:
         """Get base URL for cache files"""
-        # Reload config to get latest values
-        config.reload_config()
-
         # Use configured cache base URL if available
         if config.cache_base_url:
             return config.cache_base_url.rstrip('/')

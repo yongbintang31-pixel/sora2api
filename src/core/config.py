@@ -141,7 +141,7 @@ class Config:
     @property
     def cache_enabled(self) -> bool:
         """Get cache enabled status"""
-        return self._config.get("cache", {}).get("enabled", True)
+        return self._config.get("cache", {}).get("enabled", False)
 
     def set_cache_enabled(self, enabled: bool):
         """Set cache enabled status"""
