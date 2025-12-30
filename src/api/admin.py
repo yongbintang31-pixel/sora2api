@@ -351,6 +351,9 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
         updated_count = 0
 
         for import_item in request.tokens:
+            # Debug log
+            print(f"🔍 导入Token: email={import_item.email}, proxy_url={import_item.proxy_url}")
+            
             # Check if token with this email already exists
             existing_token = await db.get_token_by_email(import_item.email)
 
