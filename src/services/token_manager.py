@@ -59,9 +59,16 @@ class TokenManager:
         # 转换为小写
         return format_choice.lower()
 
-    async def get_user_info(self, access_token: str) -> dict:
-        """Get user info from Sora API"""
-        proxy_url = await self.proxy_manager.get_proxy_url()
+    async def get_user_info(self, access_token: str, proxy_url: Optional[str] = None) -> dict:
+        """Get user info from Sora API
+        
+        Args:
+            access_token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+        """
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
         async with AsyncSession() as session:
             headers = {
@@ -90,8 +97,12 @@ class TokenManager:
 
             return response.json()
 
-    async def get_subscription_info(self, token: str) -> Dict[str, Any]:
+    async def get_subscription_info(self, token: str, proxy_url: Optional[str] = None) -> Dict[str, Any]:
         """Get subscription information from Sora API
+        
+        Args:
+            token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
 
         Returns:
             {
@@ -101,7 +112,9 @@ class TokenManager:
             }
         """
         print(f"🔍 开始获取订阅信息...")
-        proxy_url = await self.proxy_manager.get_proxy_url()
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
         headers = {
             "Authorization": f"Bearer {token}"
@@ -163,9 +176,16 @@ class TokenManager:
 
                 raise Exception(f"Failed to get subscription info: {response.status_code}")
 
-    async def get_sora2_invite_code(self, access_token: str) -> dict:
-        """Get Sora2 invite code"""
-        proxy_url = await self.proxy_manager.get_proxy_url()
+    async def get_sora2_invite_code(self, access_token: str, proxy_url: Optional[str] = None) -> dict:
+        """Get Sora2 invite code
+        
+        Args:
+            access_token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+        """
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
         print(f"🔍 开始获取Sora2邀请码...")
 
@@ -263,8 +283,12 @@ class TokenManager:
                     "invite_code": None
                 }
 
-    async def get_sora2_remaining_count(self, access_token: str) -> dict:
+    async def get_sora2_remaining_count(self, access_token: str, proxy_url: Optional[str] = None) -> dict:
         """Get Sora2 remaining video count
+        
+        Args:
+            access_token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
 
         Returns:
             {
@@ -273,7 +297,9 @@ class TokenManager:
                 "access_resets_in_seconds": 46833
             }
         """
-        proxy_url = await self.proxy_manager.get_proxy_url()
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
         print(f"🔍 开始获取Sora2剩余次数...")
 
@@ -320,17 +346,20 @@ class TokenManager:
                     "error": f"Failed to get remaining count: {response.status_code}"
                 }
 
-    async def check_username_available(self, access_token: str, username: str) -> bool:
+    async def check_username_available(self, access_token: str, username: str, proxy_url: Optional[str] = None) -> bool:
         """Check if username is available
 
         Args:
             access_token: Access token for authentication
             username: Username to check
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
 
         Returns:
             True if username is available, False otherwise
         """
-        proxy_url = await self.proxy_manager.get_proxy_url()
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
         print(f"🔍 检查用户名是否可用: {username}")
 
@@ -368,17 +397,20 @@ class TokenManager:
                 print(f"📄 响应内容: {response.text[:500]}")
                 return False
 
-    async def set_username(self, access_token: str, username: str) -> dict:
+    async def set_username(self, access_token: str, username: str, proxy_url: Optional[str] = None) -> dict:
         """Set username for the account
 
         Args:
             access_token: Access token for authentication
             username: Username to set
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
 
         Returns:
             User profile information after setting username
         """
-        proxy_url = await self.proxy_manager.get_proxy_url()
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
         print(f"🔍 开始设置用户名: {username}")
 
@@ -677,7 +709,7 @@ class TokenManager:
             if not update_if_exists:
                 raise ValueError(f"Token 已存在（邮箱: {existing_token.email}）。如需更新，请先删除旧 Token 或使用更新功能。")
             # Update existing token
-            return await self.update_existing_token(existing_token.id, token_value, st, rt, remark)
+            return await self.update_existing_token(existing_token.id, token_value, st, rt, remark, proxy_url)
 
         # Decode JWT to get expiry time and email
         decoded = await self.decode_jwt(token_value)
@@ -692,7 +724,7 @@ class TokenManager:
 
         # Get user info from Sora API
         try:
-            user_info = await self.get_user_info(token_value)
+            user_info = await self.get_user_info(token_value, proxy_url=proxy_url)
             email = user_info.get("email", jwt_email or "")
             name = user_info.get("name") or ""
         except Exception as e:
@@ -705,7 +737,7 @@ class TokenManager:
         plan_title = None
         subscription_end = None
         try:
-            sub_info = await self.get_subscription_info(token_value)
+            sub_info = await self.get_subscription_info(token_value, proxy_url=proxy_url)
             plan_type = sub_info.get("plan_type")
             plan_title = sub_info.get("plan_title")
             # Parse subscription end time
@@ -727,7 +759,7 @@ class TokenManager:
         sora2_total_count = 0
         sora2_remaining_count = 0
         try:
-            sora2_info = await self.get_sora2_invite_code(token_value)
+            sora2_info = await self.get_sora2_invite_code(token_value, proxy_url=proxy_url)
             sora2_supported = sora2_info.get("supported", False)
             sora2_invite_code = sora2_info.get("invite_code")
             sora2_redeemed_count = sora2_info.get("redeemed_count", 0)
@@ -736,7 +768,7 @@ class TokenManager:
             # If Sora2 is supported, get remaining count
             if sora2_supported:
                 try:
-                    remaining_info = await self.get_sora2_remaining_count(token_value)
+                    remaining_info = await self.get_sora2_remaining_count(token_value, proxy_url=proxy_url)
                     if remaining_info.get("success"):
                         sora2_remaining_count = remaining_info.get("remaining_count", 0)
                         print(f"✅ Sora2剩余次数: {sora2_remaining_count}")
@@ -753,7 +785,7 @@ class TokenManager:
         # Check and set username if needed
         try:
             # Get fresh user info to check username
-            user_info = await self.get_user_info(token_value)
+            user_info = await self.get_user_info(token_value, proxy_url=proxy_url)
             username = user_info.get("username")
 
             # If username is null, need to set one
@@ -767,10 +799,10 @@ class TokenManager:
                     print(f"🔄 尝试用户名 ({attempt + 1}/{max_attempts}): {generated_username}")
 
                     # Check if username is available
-                    if await self.check_username_available(token_value, generated_username):
+                    if await self.check_username_available(token_value, generated_username, proxy_url=proxy_url):
                         # Set the username
                         try:
-                            await self.set_username(token_value, generated_username)
+                            await self.set_username(token_value, generated_username, proxy_url=proxy_url)
                             print(f"✅ 用户名设置成功: {generated_username}")
                             break
                         except Exception as e:
@@ -821,7 +853,8 @@ class TokenManager:
     async def update_existing_token(self, token_id: int, token_value: str,
                                     st: Optional[str] = None,
                                     rt: Optional[str] = None,
-                                    remark: Optional[str] = None) -> Token:
+                                    remark: Optional[str] = None,
+                                    proxy_url: Optional[str] = None) -> Token:
         """Update an existing token with new information"""
         # Decode JWT to get expiry time
         decoded = await self.decode_jwt(token_value)
@@ -833,7 +866,7 @@ class TokenManager:
             jwt_email = decoded["https://api.openai.com/profile"].get("email")
 
         try:
-            user_info = await self.get_user_info(token_value)
+            user_info = await self.get_user_info(token_value, proxy_url=proxy_url)
             email = user_info.get("email", jwt_email or "")
             name = user_info.get("name", "")
         except Exception as e:
@@ -845,7 +878,7 @@ class TokenManager:
         plan_title = None
         subscription_end = None
         try:
-            sub_info = await self.get_subscription_info(token_value)
+            sub_info = await self.get_subscription_info(token_value, proxy_url=proxy_url)
             plan_type = sub_info.get("plan_type")
             plan_title = sub_info.get("plan_title")
             if sub_info.get("subscription_end"):
@@ -930,11 +963,14 @@ class TokenManager:
             return {"valid": False, "message": "Token not found"}
 
         try:
+            # Use token's own proxy_url if available, otherwise use global proxy
+            token_proxy_url = token_data.proxy_url if token_data.proxy_url else None
+            
             # Try to get user info from Sora API
-            user_info = await self.get_user_info(token_data.token)
+            user_info = await self.get_user_info(token_data.token, proxy_url=token_proxy_url)
 
             # Refresh Sora2 invite code and counts
-            sora2_info = await self.get_sora2_invite_code(token_data.token)
+            sora2_info = await self.get_sora2_invite_code(token_data.token, proxy_url=token_proxy_url)
             sora2_supported = sora2_info.get("supported", False)
             sora2_invite_code = sora2_info.get("invite_code")
             sora2_redeemed_count = sora2_info.get("redeemed_count", 0)
@@ -944,7 +980,7 @@ class TokenManager:
             # If Sora2 is supported, get remaining count
             if sora2_supported:
                 try:
-                    remaining_info = await self.get_sora2_remaining_count(token_data.token)
+                    remaining_info = await self.get_sora2_remaining_count(token_data.token, proxy_url=token_proxy_url)
                     if remaining_info.get("success"):
                         sora2_remaining_count = remaining_info.get("remaining_count", 0)
                 except Exception as e:
