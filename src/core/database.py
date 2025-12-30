@@ -1,600 +1,917 @@
-"""Database storage layer"""
-import aiosqlite
-import json
-from datetime import datetime
-from typing import Optional, List
-from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig
+"""Token management module"""
+import jwt
+import asyncio
+import random
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+from curl_cffi.requests import AsyncSession
+from faker import Faker
+from ..core.database import Database
+from ..core.models import Token, TokenStats
+from ..core.config import config
+from .proxy_manager import ProxyManager
+from ..core.logger import debug_logger
 
-class Database:
-    """SQLite database manager"""
+class TokenManager:
+    """Token lifecycle manager"""
 
-    def __init__(self, db_path: str = None):
-        if db_path is None:
-            # Store database in data directory
-            data_dir = Path(__file__).parent.parent.parent / "data"
-            data_dir.mkdir(exist_ok=True)
-            db_path = str(data_dir / "hancat.db")
-        self.db_path = db_path
-
-    def db_exists(self) -> bool:
-        """Check if database file exists"""
-        return Path(self.db_path).exists()
-
-    async def _table_exists(self, db, table_name: str) -> bool:
-        """Check if a table exists in the database"""
-        cursor = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (table_name,)
-        )
-        result = await cursor.fetchone()
-        return result is not None
-
-    async def _column_exists(self, db, table_name: str, column_name: str) -> bool:
-        """Check if a column exists in a table"""
+    def __init__(self, db: Database):
+        self.db = db
+        self._lock = asyncio.Lock()
+        self.proxy_manager = ProxyManager(db)
+        self.fake = Faker()
+    
+    async def decode_jwt(self, token: str) -> dict:
+        """Decode JWT token without verification"""
         try:
-            cursor = await db.execute(f"PRAGMA table_info({table_name})")
-            columns = await cursor.fetchall()
-            return any(col[1] == column_name for col in columns)
-        except:
-            return False
+            decoded = jwt.decode(token, options={"verify_signature": False})
+            return decoded
+        except Exception as e:
+            raise ValueError(f"Invalid JWT token: {str(e)}")
 
-    async def _ensure_config_rows(self, db, config_dict: dict = None):
-        """Ensure all config tables have their default rows
+    def _generate_random_username(self) -> str:
+        """Generate a random username using faker
 
+        Returns:
+            A random username string
+        """
+        # 生成真实姓名
+        first_name = self.fake.first_name()
+        last_name = self.fake.last_name()
+
+        # 去除姓名中的空格和特殊字符，只保留字母
+        first_name_clean = ''.join(c for c in first_name if c.isalpha())
+        last_name_clean = ''.join(c for c in last_name if c.isalpha())
+
+        # 生成1-4位随机数字
+        random_digits = str(random.randint(1, 9999))
+
+        # 随机选择用户名格式
+        format_choice = random.choice([
+            f"{first_name_clean}{last_name_clean}{random_digits}",
+            f"{first_name_clean}.{last_name_clean}{random_digits}",
+            f"{first_name_clean}{random_digits}",
+            f"{last_name_clean}{random_digits}",
+            f"{first_name_clean[0]}{last_name_clean}{random_digits}",
+            f"{first_name_clean}{last_name_clean[0]}{random_digits}"
+        ])
+
+        # 转换为小写
+        return format_choice.lower()
+
+    async def get_user_info(self, access_token: str, proxy_url: Optional[str] = None) -> dict:
+        """Get user info from Sora API
+        
         Args:
-            db: Database connection
-            config_dict: Configuration dictionary from setting.toml (optional)
+            access_token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
         """
-        # Ensure admin_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM admin_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get admin credentials from config_dict if provided, otherwise use defaults
-            admin_username = "admin"
-            admin_password = "admin"
-            api_key = "han1234"
-            error_ban_threshold = 3
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
-            if config_dict:
-                global_config = config_dict.get("global", {})
-                admin_username = global_config.get("admin_username", "admin")
-                admin_password = global_config.get("admin_password", "admin")
-                api_key = global_config.get("api_key", "han1234")
+        async with AsyncSession() as session:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
+            }
 
-                admin_config = config_dict.get("admin", {})
-                error_ban_threshold = admin_config.get("error_ban_threshold", 3)
+            kwargs = {
+                "headers": headers,
+                "timeout": 30,
+                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+            }
 
-            await db.execute("""
-                INSERT INTO admin_config (id, admin_username, admin_password, api_key, error_ban_threshold)
-                VALUES (1, ?, ?, ?, ?)
-            """, (admin_username, admin_password, api_key, error_ban_threshold))
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
 
-        # Ensure proxy_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM proxy_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get proxy config from config_dict if provided, otherwise use defaults
-            proxy_enabled = False
-            proxy_url = None
+            response = await session.get(
+                f"{config.sora_base_url}/me",
+                **kwargs
+            )
 
-            if config_dict:
-                proxy_config = config_dict.get("proxy", {})
-                proxy_enabled = proxy_config.get("proxy_enabled", False)
-                proxy_url = proxy_config.get("proxy_url", "")
-                # Convert empty string to None
-                proxy_url = proxy_url if proxy_url else None
+            if response.status_code != 200:
+                raise ValueError(f"Failed to get user info: {response.status_code}")
 
-            await db.execute("""
-                INSERT INTO proxy_config (id, proxy_enabled, proxy_url)
-                VALUES (1, ?, ?)
-            """, (proxy_enabled, proxy_url))
+            return response.json()
 
-        # Ensure watermark_free_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM watermark_free_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get watermark-free config from config_dict if provided, otherwise use defaults
-            watermark_free_enabled = False
-            parse_method = "third_party"
-            custom_parse_url = None
-            custom_parse_token = None
-
-            if config_dict:
-                watermark_config = config_dict.get("watermark_free", {})
-                watermark_free_enabled = watermark_config.get("watermark_free_enabled", False)
-                parse_method = watermark_config.get("parse_method", "third_party")
-                custom_parse_url = watermark_config.get("custom_parse_url", "")
-                custom_parse_token = watermark_config.get("custom_parse_token", "")
-
-                # Convert empty strings to None
-                custom_parse_url = custom_parse_url if custom_parse_url else None
-                custom_parse_token = custom_parse_token if custom_parse_token else None
-
-            await db.execute("""
-                INSERT INTO watermark_free_config (id, watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token)
-                VALUES (1, ?, ?, ?, ?)
-            """, (watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token))
-
-        # Ensure cache_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM cache_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get cache config from config_dict if provided, otherwise use defaults
-            cache_enabled = False
-            cache_timeout = 600
-            cache_base_url = None
-
-            if config_dict:
-                cache_config = config_dict.get("cache", {})
-                cache_enabled = cache_config.get("enabled", False)
-                cache_timeout = cache_config.get("timeout", 600)
-                cache_base_url = cache_config.get("base_url", "")
-                # Convert empty string to None
-                cache_base_url = cache_base_url if cache_base_url else None
-
-            await db.execute("""
-                INSERT INTO cache_config (id, cache_enabled, cache_timeout, cache_base_url)
-                VALUES (1, ?, ?, ?)
-            """, (cache_enabled, cache_timeout, cache_base_url))
-
-        # Ensure generation_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM generation_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get generation config from config_dict if provided, otherwise use defaults
-            image_timeout = 300
-            video_timeout = 3000
-
-            if config_dict:
-                generation_config = config_dict.get("generation", {})
-                image_timeout = generation_config.get("image_timeout", 300)
-                video_timeout = generation_config.get("video_timeout", 3000)
-
-            await db.execute("""
-                INSERT INTO generation_config (id, image_timeout, video_timeout)
-                VALUES (1, ?, ?)
-            """, (image_timeout, video_timeout))
-
-        # Ensure token_refresh_config has a row
-        cursor = await db.execute("SELECT COUNT(*) FROM token_refresh_config")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            # Get token refresh config from config_dict if provided, otherwise use defaults
-            at_auto_refresh_enabled = False
-
-            if config_dict:
-                token_refresh_config = config_dict.get("token_refresh", {})
-                at_auto_refresh_enabled = token_refresh_config.get("at_auto_refresh_enabled", False)
-
-            await db.execute("""
-                INSERT INTO token_refresh_config (id, at_auto_refresh_enabled)
-                VALUES (1, ?)
-            """, (at_auto_refresh_enabled,))
-
-
-    async def check_and_migrate_db(self, config_dict: dict = None):
-        """Check database integrity and perform migrations if needed
-
+    async def get_subscription_info(self, token: str, proxy_url: Optional[str] = None) -> Dict[str, Any]:
+        """Get subscription information from Sora API
+        
         Args:
-            config_dict: Configuration dictionary from setting.toml (optional)
-                        Used to initialize new tables with values from setting.toml
+            token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+
+        Returns:
+            {
+                "plan_type": "chatgpt_team",
+                "plan_title": "ChatGPT Business",
+                "subscription_end": "2025-11-13T16:58:21Z"
+            }
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            print("Checking database integrity and performing migrations...")
+        print(f"🔍 开始获取订阅信息...")
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
-            # Check and add missing columns to tokens table
-            if await self._table_exists(db, "tokens"):
-                columns_to_add = [
-                    ("sora2_supported", "BOOLEAN"),
-                    ("sora2_invite_code", "TEXT"),
-                    ("sora2_redeemed_count", "INTEGER DEFAULT 0"),
-                    ("sora2_total_count", "INTEGER DEFAULT 0"),
-                    ("sora2_remaining_count", "INTEGER DEFAULT 0"),
-                    ("sora2_cooldown_until", "TIMESTAMP"),
-                    ("image_enabled", "BOOLEAN DEFAULT 1"),
-                    ("video_enabled", "BOOLEAN DEFAULT 1"),
-                    ("image_concurrency", "INTEGER DEFAULT -1"),
-                    ("video_concurrency", "INTEGER DEFAULT -1"),
-                    ("client_id", "TEXT"),
-                    ("proxy_url", "TEXT"),
-                ]
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
 
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "tokens", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to tokens table")
-                        except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+        async with AsyncSession() as session:
+            url = "https://sora.chatgpt.com/backend/billing/subscriptions"
+            print(f"📡 请求 URL: {url}")
+            print(f"🔑 使用 Token: {token[:30]}...")
 
-            # Check and add missing columns to token_stats table
-            if await self._table_exists(db, "token_stats"):
-                columns_to_add = [
-                    ("consecutive_error_count", "INTEGER DEFAULT 0"),
-                ]
+            kwargs = {
+                "headers": headers,
+                "timeout": 30,
+                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+            }
 
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "token_stats", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE token_stats ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to token_stats table")
-                        except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                print(f"🌐 使用代理: {proxy_url}")
 
-            # Check and add missing columns to admin_config table
-            if await self._table_exists(db, "admin_config"):
-                columns_to_add = [
-                    ("admin_username", "TEXT DEFAULT 'admin'"),
-                    ("admin_password", "TEXT DEFAULT 'admin'"),
-                    ("api_key", "TEXT DEFAULT 'han1234'"),
-                ]
+            response = await session.get(url, **kwargs)
+            print(f"📥 响应状态码: {response.status_code}")
 
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "admin_config", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE admin_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to admin_config table")
-                        except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+            if response.status_code == 200:
+                data = response.json()
+                print(f"📦 响应数据: {data}")
 
-            # Check and add missing columns to watermark_free_config table
-            if await self._table_exists(db, "watermark_free_config"):
-                columns_to_add = [
-                    ("parse_method", "TEXT DEFAULT 'third_party'"),
-                    ("custom_parse_url", "TEXT"),
-                    ("custom_parse_token", "TEXT"),
-                ]
+                # 提取第一个订阅信息
+                if data.get("data") and len(data["data"]) > 0:
+                    subscription = data["data"][0]
+                    plan = subscription.get("plan", {})
 
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "watermark_free_config", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE watermark_free_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  ✓ Added column '{col_name}' to watermark_free_config table")
-                        except Exception as e:
-                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+                    result = {
+                        "plan_type": plan.get("id", ""),
+                        "plan_title": plan.get("title", ""),
+                        "subscription_end": subscription.get("end_ts", "")
+                    }
+                    print(f"✅ 订阅信息提取成功: {result}")
+                    return result
 
-            # Ensure all config tables have their default rows
-            # Pass config_dict if available to initialize from setting.toml
-            await self._ensure_config_rows(db, config_dict)
-
-            await db.commit()
-            print("Database migration check completed.")
-
-    async def init_db(self):
-        """Initialize database tables - creates all tables and ensures data integrity"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Tokens table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tokens (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token TEXT UNIQUE NOT NULL,
-                    email TEXT NOT NULL,
-                    username TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    st TEXT,
-                    rt TEXT,
-                    client_id TEXT,
-                    proxy_url TEXT,
-                    remark TEXT,
-                    expiry_time TIMESTAMP,
-                    is_active BOOLEAN DEFAULT 1,
-                    cooled_until TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used_at TIMESTAMP,
-                    use_count INTEGER DEFAULT 0,
-                    plan_type TEXT,
-                    plan_title TEXT,
-                    subscription_end TIMESTAMP,
-                    sora2_supported BOOLEAN,
-                    sora2_invite_code TEXT,
-                    sora2_redeemed_count INTEGER DEFAULT 0,
-                    sora2_total_count INTEGER DEFAULT 0,
-                    sora2_remaining_count INTEGER DEFAULT 0,
-                    sora2_cooldown_until TIMESTAMP,
-                    image_enabled BOOLEAN DEFAULT 1,
-                    video_enabled BOOLEAN DEFAULT 1,
-                    image_concurrency INTEGER DEFAULT -1,
-                    video_concurrency INTEGER DEFAULT -1
-                )
-            """)
-
-            # Token stats table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS token_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token_id INTEGER NOT NULL,
-                    image_count INTEGER DEFAULT 0,
-                    video_count INTEGER DEFAULT 0,
-                    error_count INTEGER DEFAULT 0,
-                    last_error_at TIMESTAMP,
-                    today_image_count INTEGER DEFAULT 0,
-                    today_video_count INTEGER DEFAULT 0,
-                    today_error_count INTEGER DEFAULT 0,
-                    today_date DATE,
-                    consecutive_error_count INTEGER DEFAULT 0,
-                    FOREIGN KEY (token_id) REFERENCES tokens(id)
-                )
-            """)
-
-            # Tasks table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT UNIQUE NOT NULL,
-                    token_id INTEGER NOT NULL,
-                    model TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'processing',
-                    progress FLOAT DEFAULT 0,
-                    result_urls TEXT,
-                    error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    FOREIGN KEY (token_id) REFERENCES tokens(id)
-                )
-            """)
-
-            # Request logs table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS request_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token_id INTEGER,
-                    operation TEXT NOT NULL,
-                    request_body TEXT,
-                    response_body TEXT,
-                    status_code INTEGER NOT NULL,
-                    duration FLOAT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (token_id) REFERENCES tokens(id)
-                )
-            """)
-
-            # Admin config table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS admin_config (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    admin_username TEXT DEFAULT 'admin',
-                    admin_password TEXT DEFAULT 'admin',
-                    api_key TEXT DEFAULT 'han1234',
-                    error_ban_threshold INTEGER DEFAULT 3,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Proxy config table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS proxy_config (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    proxy_enabled BOOLEAN DEFAULT 0,
-                    proxy_url TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Watermark-free config table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS watermark_free_config (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    watermark_free_enabled BOOLEAN DEFAULT 0,
-                    parse_method TEXT DEFAULT 'third_party',
-                    custom_parse_url TEXT,
-                    custom_parse_token TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Cache config table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS cache_config (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    cache_enabled BOOLEAN DEFAULT 0,
-                    cache_timeout INTEGER DEFAULT 600,
-                    cache_base_url TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Generation config table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS generation_config (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    image_timeout INTEGER DEFAULT 300,
-                    video_timeout INTEGER DEFAULT 3000,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Token refresh config table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS token_refresh_config (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    at_auto_refresh_enabled BOOLEAN DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Create indexes
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_token_active ON tokens(is_active)")
-
-            # Migration: Add daily statistics columns if they don't exist
-            if not await self._column_exists(db, "token_stats", "today_image_count"):
-                await db.execute("ALTER TABLE token_stats ADD COLUMN today_image_count INTEGER DEFAULT 0")
-            if not await self._column_exists(db, "token_stats", "today_video_count"):
-                await db.execute("ALTER TABLE token_stats ADD COLUMN today_video_count INTEGER DEFAULT 0")
-            if not await self._column_exists(db, "token_stats", "today_error_count"):
-                await db.execute("ALTER TABLE token_stats ADD COLUMN today_error_count INTEGER DEFAULT 0")
-            if not await self._column_exists(db, "token_stats", "today_date"):
-                await db.execute("ALTER TABLE token_stats ADD COLUMN today_date DATE")
-
-            await db.commit()
-
-    async def init_config_from_toml(self, config_dict: dict, is_first_startup: bool = True):
-        """
-        Initialize database configuration from setting.toml
-
-        Args:
-            config_dict: Configuration dictionary from setting.toml
-            is_first_startup: If True, initialize all config rows from setting.toml.
-                            If False (upgrade mode), only ensure missing config rows exist with default values.
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            if is_first_startup:
-                # First startup: Initialize all config tables with values from setting.toml
-                await self._ensure_config_rows(db, config_dict)
+                print(f"⚠️  响应数据中没有订阅信息")
+                return {
+                    "plan_type": "",
+                    "plan_title": "",
+                    "subscription_end": ""
+                }
             else:
-                # Upgrade mode: Only ensure missing config rows exist (with default values, not from TOML)
-                await self._ensure_config_rows(db, config_dict=None)
+                print(f"❌ Failed to get subscription info: {response.status_code}")
+                print(f"📄 响应内容: {response.text}")
 
-            await db.commit()
+                # Check for token_expired error
+                try:
+                    error_data = response.json()
+                    error_info = error_data.get("error", {})
+                    if error_info.get("code") == "token_expired":
+                        raise Exception(f"Token已过期: {error_info.get('message', 'Token expired')}")
+                except ValueError:
+                    pass
 
-    # Token operations
-    async def add_token(self, token: Token) -> int:
-        """Add a new token"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                INSERT INTO tokens (token, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
-                                   plan_type, plan_title, subscription_end, sora2_supported, sora2_invite_code,
-                                   sora2_redeemed_count, sora2_total_count, sora2_remaining_count, sora2_cooldown_until,
-                                   image_enabled, video_enabled, image_concurrency, video_concurrency)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (token.token, token.email, "", token.name, token.st, token.rt, token.client_id, token.proxy_url,
-                  token.remark, token.expiry_time, token.is_active,
-                  token.plan_type, token.plan_title, token.subscription_end,
-                  token.sora2_supported, token.sora2_invite_code,
-                  token.sora2_redeemed_count, token.sora2_total_count,
-                  token.sora2_remaining_count, token.sora2_cooldown_until,
-                  token.image_enabled, token.video_enabled,
-                  token.image_concurrency, token.video_concurrency))
-            await db.commit()
-            token_id = cursor.lastrowid
+                raise Exception(f"Failed to get subscription info: {response.status_code}")
 
-            # Create stats entry
-            await db.execute("""
-                INSERT INTO token_stats (token_id) VALUES (?)
-            """, (token_id,))
-            await db.commit()
+    async def get_sora2_invite_code(self, access_token: str, proxy_url: Optional[str] = None) -> dict:
+        """Get Sora2 invite code
+        
+        Args:
+            access_token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+        """
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
 
-            return token_id
-    
-    async def get_token(self, token_id: int) -> Optional[Token]:
-        """Get token by ID"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens WHERE id = ?", (token_id,))
-            row = await cursor.fetchone()
-            if row:
-                return Token(**dict(row))
-            return None
-    
-    async def get_token_by_value(self, token: str) -> Optional[Token]:
-        """Get token by value"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens WHERE token = ?", (token,))
-            row = await cursor.fetchone()
-            if row:
-                return Token(**dict(row))
-            return None
+        print(f"🔍 开始获取Sora2邀请码...")
 
-    async def get_token_by_email(self, email: str) -> Optional[Token]:
-        """Get token by email"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens WHERE email = ?", (email,))
-            row = await cursor.fetchone()
-            if row:
-                return Token(**dict(row))
-            return None
-    
-    async def get_active_tokens(self) -> List[Token]:
-        """Get all active tokens (enabled, not cooled down, not expired)"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
-                SELECT * FROM tokens
-                WHERE is_active = 1
-                AND (cooled_until IS NULL OR cooled_until < CURRENT_TIMESTAMP)
-                AND expiry_time > CURRENT_TIMESTAMP
-                ORDER BY last_used_at ASC NULLS FIRST
-            """)
-            rows = await cursor.fetchall()
-            return [Token(**dict(row)) for row in rows]
-    
-    async def get_all_tokens(self) -> List[Token]:
-        """Get all tokens"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens ORDER BY created_at DESC")
-            rows = await cursor.fetchall()
-            return [Token(**dict(row)) for row in rows]
-    
-    async def update_token_usage(self, token_id: int):
-        """Update token usage"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens 
-                SET last_used_at = CURRENT_TIMESTAMP, use_count = use_count + 1
-                WHERE id = ?
-            """, (token_id,))
-            await db.commit()
-    
-    async def update_token_status(self, token_id: int, is_active: bool):
-        """Update token status"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET is_active = ? WHERE id = ?
-            """, (is_active, token_id))
-            await db.commit()
-    
-    async def update_token_sora2(self, token_id: int, supported: bool, invite_code: Optional[str] = None,
-                                redeemed_count: int = 0, total_count: int = 0, remaining_count: int = 0):
-        """Update token Sora2 support info"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens
-                SET sora2_supported = ?, sora2_invite_code = ?, sora2_redeemed_count = ?, sora2_total_count = ?, sora2_remaining_count = ?
-                WHERE id = ?
-            """, (supported, invite_code, redeemed_count, total_count, remaining_count, token_id))
-            await db.commit()
+        async with AsyncSession() as session:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json"
+            }
 
-    async def update_token_sora2_remaining(self, token_id: int, remaining_count: int):
-        """Update token Sora2 remaining count"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET sora2_remaining_count = ? WHERE id = ?
-            """, (remaining_count, token_id))
-            await db.commit()
+            kwargs = {
+                "headers": headers,
+                "timeout": 30,
+                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+            }
 
-    async def update_token_sora2_cooldown(self, token_id: int, cooldown_until: Optional[datetime]):
-        """Update token Sora2 cooldown time"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET sora2_cooldown_until = ? WHERE id = ?
-            """, (cooldown_until, token_id))
-            await db.commit()
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                print(f"🌐 使用代理: {proxy_url}")
 
-    async def update_token_cooldown(self, token_id: int, cooled_until: datetime):
-        """Update token cooldown"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET cooled_until = ? WHERE id = ?
-            """, (cooled_until, token_id))
-            await db.commit()
+            response = await session.get(
+                "https://sora.chatgpt.com/backend/project_y/invite/mine",
+                **kwargs
+            )
+
+            print(f"📥 响应状态码: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"✅ Sora2邀请码获取成功: {data}")
+                return {
+                    "supported": True,
+                    "invite_code": data.get("invite_code"),
+                    "redeemed_count": data.get("redeemed_count", 0),
+                    "total_count": data.get("total_count", 0)
+                }
+            else:
+                print(f"❌ 获取Sora2邀请码失败: {response.status_code}")
+                print(f"📄 响应内容: {response.text}")
+
+                # Check for specific errors
+                try:
+                    error_data = response.json()
+                    error_info = error_data.get("error", {})
+
+                    # Check for unsupported_country_code
+                    if error_info.get("code") == "unsupported_country_code":
+                        country = error_info.get("param", "未知")
+                        raise Exception(f"Sora在您的国家/地区不可用 ({country}): {error_info.get('message', '')}")
+
+                    # Check if it's 401 unauthorized (token doesn't support Sora2)
+                    if response.status_code == 401 and "Unauthorized" in error_info.get("message", ""):
+                        print(f"⚠️  Token不支持Sora2，尝试激活...")
+
+                        # Try to activate Sora2
+                        try:
+                            activate_response = await session.get(
+                                "https://sora.chatgpt.com/backend/m/bootstrap",
+                                **kwargs
+                            )
+
+                            if activate_response.status_code == 200:
+                                print(f"✅ Sora2激活请求成功，重新获取邀请码...")
+
+                                # Retry getting invite code
+                                retry_response = await session.get(
+                                    "https://sora.chatgpt.com/backend/project_y/invite/mine",
+                                    **kwargs
+                                )
+
+                                if retry_response.status_code == 200:
+                                    retry_data = retry_response.json()
+                                    print(f"✅ Sora2激活成功！邀请码: {retry_data}")
+                                    return {
+                                        "supported": True,
+                                        "invite_code": retry_data.get("invite_code"),
+                                        "redeemed_count": retry_data.get("redeemed_count", 0),
+                                        "total_count": retry_data.get("total_count", 0)
+                                    }
+                                else:
+                                    print(f"⚠️  激活后仍无法获取邀请码: {retry_response.status_code}")
+                            else:
+                                print(f"⚠️  Sora2激活失败: {activate_response.status_code}")
+                        except Exception as activate_e:
+                            print(f"⚠️  Sora2激活过程出错: {activate_e}")
+
+                        return {
+                            "supported": False,
+                            "invite_code": None
+                        }
+                except ValueError:
+                    pass
+
+                return {
+                    "supported": False,
+                    "invite_code": None
+                }
+
+    async def get_sora2_remaining_count(self, access_token: str, proxy_url: Optional[str] = None) -> dict:
+        """Get Sora2 remaining video count
+        
+        Args:
+            access_token: Access token for authentication
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+
+        Returns:
+            {
+                "remaining_count": 27,
+                "rate_limit_reached": false,
+                "access_resets_in_seconds": 46833
+            }
+        """
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
+
+        print(f"🔍 开始获取Sora2剩余次数...")
+
+        async with AsyncSession() as session:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json"
+            }
+
+            kwargs = {
+                "headers": headers,
+                "timeout": 30,
+                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+            }
+
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                print(f"🌐 使用代理: {proxy_url}")
+
+            response = await session.get(
+                "https://sora.chatgpt.com/backend/nf/check",
+                **kwargs
+            )
+
+            print(f"📥 响应状态码: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"✅ Sora2剩余次数获取成功: {data}")
+
+                rate_limit_info = data.get("rate_limit_and_credit_balance", {})
+                return {
+                    "success": True,
+                    "remaining_count": rate_limit_info.get("estimated_num_videos_remaining", 0),
+                    "rate_limit_reached": rate_limit_info.get("rate_limit_reached", False),
+                    "access_resets_in_seconds": rate_limit_info.get("access_resets_in_seconds", 0)
+                }
+            else:
+                print(f"❌ 获取Sora2剩余次数失败: {response.status_code}")
+                print(f"📄 响应内容: {response.text[:500]}")
+                return {
+                    "success": False,
+                    "remaining_count": 0,
+                    "error": f"Failed to get remaining count: {response.status_code}"
+                }
+
+    async def check_username_available(self, access_token: str, username: str, proxy_url: Optional[str] = None) -> bool:
+        """Check if username is available
+
+        Args:
+            access_token: Access token for authentication
+            username: Username to check
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+
+        Returns:
+            True if username is available, False otherwise
+        """
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
+
+        print(f"🔍 检查用户名是否可用: {username}")
+
+        async with AsyncSession() as session:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+
+            kwargs = {
+                "headers": headers,
+                "json": {"username": username},
+                "timeout": 30,
+                "impersonate": "chrome"
+            }
+
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                print(f"🌐 使用代理: {proxy_url}")
+
+            response = await session.post(
+                "https://sora.chatgpt.com/backend/project_y/profile/username/check",
+                **kwargs
+            )
+
+            print(f"📥 响应状态码: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()
+                available = data.get("available", False)
+                print(f"✅ 用户名检查结果: available={available}")
+                return available
+            else:
+                print(f"❌ 用户名检查失败: {response.status_code}")
+                print(f"📄 响应内容: {response.text[:500]}")
+                return False
+
+    async def set_username(self, access_token: str, username: str, proxy_url: Optional[str] = None) -> dict:
+        """Set username for the account
+
+        Args:
+            access_token: Access token for authentication
+            username: Username to set
+            proxy_url: Optional proxy URL to use for this specific token. If None, uses global proxy.
+
+        Returns:
+            User profile information after setting username
+        """
+        # Use token-specific proxy if provided, otherwise fall back to global proxy
+        if proxy_url is None:
+            proxy_url = await self.proxy_manager.get_proxy_url()
+
+        print(f"🔍 开始设置用户名: {username}")
+
+        async with AsyncSession() as session:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+
+            kwargs = {
+                "headers": headers,
+                "json": {"username": username},
+                "timeout": 30,
+                "impersonate": "chrome"
+            }
+
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                print(f"🌐 使用代理: {proxy_url}")
+
+            response = await session.post(
+                "https://sora.chatgpt.com/backend/project_y/profile/username/set",
+                **kwargs
+            )
+
+            print(f"📥 响应状态码: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"✅ 用户名设置成功: {data.get('username')}")
+                return data
+            else:
+                print(f"❌ 用户名设置失败: {response.status_code}")
+                print(f"📄 响应内容: {response.text[:500]}")
+                raise Exception(f"Failed to set username: {response.status_code}")
+
+    async def activate_sora2_invite(self, access_token: str, invite_code: str) -> dict:
+        """Activate Sora2 with invite code"""
+        import uuid
+        proxy_url = await self.proxy_manager.get_proxy_url()
+
+        print(f"🔍 开始激活Sora2邀请码: {invite_code}")
+        print(f"🔑 Access Token 前缀: {access_token[:50]}...")
+
+        async with AsyncSession() as session:
+            # 生成设备ID
+            device_id = str(uuid.uuid4())
+
+            # 只设置必要的头，让 impersonate 处理其他
+            headers = {
+                "authorization": f"Bearer {access_token}",
+                "cookie": f"oai-did={device_id}"
+            }
+
+            print(f"🆔 设备ID: {device_id}")
+            print(f"📦 请求体: {{'invite_code': '{invite_code}'}}")
+
+            kwargs = {
+                "headers": headers,
+                "json": {"invite_code": invite_code},
+                "timeout": 30,
+                "impersonate": "chrome120"  # 使用 chrome120 让库自动处理 UA 等头
+            }
+
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                print(f"🌐 使用代理: {proxy_url}")
+
+            response = await session.post(
+                "https://sora.chatgpt.com/backend/project_y/invite/accept",
+                **kwargs
+            )
+
+            print(f"📥 响应状态码: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"✅ Sora2激活成功: {data}")
+                return {
+                    "success": data.get("success", False),
+                    "already_accepted": data.get("already_accepted", False)
+                }
+            else:
+                print(f"❌ Sora2激活失败: {response.status_code}")
+                print(f"📄 响应内容: {response.text[:500]}")
+                raise Exception(f"Failed to activate Sora2: {response.status_code}")
+
+    async def st_to_at(self, session_token: str) -> dict:
+        """Convert Session Token to Access Token"""
+        debug_logger.log_info(f"[ST_TO_AT] 开始转换 Session Token 为 Access Token...")
+        proxy_url = await self.proxy_manager.get_proxy_url()
+
+        async with AsyncSession() as session:
+            headers = {
+                "Cookie": f"__Secure-next-auth.session-token={session_token}",
+                "Accept": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
+            }
+
+            kwargs = {
+                "headers": headers,
+                "timeout": 30,
+                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+            }
+
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                debug_logger.log_info(f"[ST_TO_AT] 使用代理: {proxy_url}")
+
+            url = "https://sora.chatgpt.com/api/auth/session"
+            debug_logger.log_info(f"[ST_TO_AT] 📡 请求 URL: {url}")
+
+            try:
+                response = await session.get(url, **kwargs)
+                debug_logger.log_info(f"[ST_TO_AT] 📥 响应状态码: {response.status_code}")
+
+                if response.status_code != 200:
+                    error_msg = f"Failed to convert ST to AT: {response.status_code}"
+                    debug_logger.log_info(f"[ST_TO_AT] ❌ {error_msg}")
+                    debug_logger.log_info(f"[ST_TO_AT] 响应内容: {response.text[:500]}")
+                    raise ValueError(error_msg)
+
+                # 获取响应文本用于调试
+                response_text = response.text
+                debug_logger.log_info(f"[ST_TO_AT] 📄 响应内容: {response_text[:500]}")
+
+                # 检查响应是否为空
+                if not response_text or response_text.strip() == "":
+                    debug_logger.log_info(f"[ST_TO_AT] ❌ 响应体为空")
+                    raise ValueError("Response body is empty")
+
+                try:
+                    data = response.json()
+                except Exception as json_err:
+                    debug_logger.log_info(f"[ST_TO_AT] ❌ JSON解析失败: {str(json_err)}")
+                    debug_logger.log_info(f"[ST_TO_AT] 原始响应: {response_text[:1000]}")
+                    raise ValueError(f"Failed to parse JSON response: {str(json_err)}")
+
+                # 检查data是否为None
+                if data is None:
+                    debug_logger.log_info(f"[ST_TO_AT] ❌ 响应JSON为空")
+                    raise ValueError("Response JSON is empty")
+
+                access_token = data.get("accessToken")
+                email = data.get("user", {}).get("email") if data.get("user") else None
+                expires = data.get("expires")
+
+                # 检查必要字段
+                if not access_token:
+                    debug_logger.log_info(f"[ST_TO_AT] ❌ 响应中缺少 accessToken 字段")
+                    debug_logger.log_info(f"[ST_TO_AT] 响应数据: {data}")
+                    raise ValueError("Missing accessToken in response")
+
+                debug_logger.log_info(f"[ST_TO_AT] ✅ ST 转换成功")
+                debug_logger.log_info(f"  - Email: {email}")
+                debug_logger.log_info(f"  - 过期时间: {expires}")
+
+                return {
+                    "access_token": access_token,
+                    "email": email,
+                    "expires": expires
+                }
+            except Exception as e:
+                debug_logger.log_info(f"[ST_TO_AT] 🔴 异常: {str(e)}")
+                raise
     
+    async def rt_to_at(self, refresh_token: str, client_id: Optional[str] = None) -> dict:
+        """Convert Refresh Token to Access Token
+
+        Args:
+            refresh_token: Refresh Token
+            client_id: Client ID (optional, uses default if not provided)
+        """
+        # Use provided client_id or default
+        effective_client_id = client_id or "app_LlGpXReQgckcGGUo2JrYvtJK"
+
+        debug_logger.log_info(f"[RT_TO_AT] 开始转换 Refresh Token 为 Access Token...")
+        debug_logger.log_info(f"[RT_TO_AT] 使用 Client ID: {effective_client_id[:20]}...")
+        proxy_url = await self.proxy_manager.get_proxy_url()
+
+        async with AsyncSession() as session:
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+
+            kwargs = {
+                "headers": headers,
+                "json": {
+                    "client_id": effective_client_id,
+                    "grant_type": "refresh_token",
+                    "redirect_uri": "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
+                    "refresh_token": refresh_token
+                },
+                "timeout": 30,
+                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+            }
+
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                debug_logger.log_info(f"[RT_TO_AT] 使用代理: {proxy_url}")
+
+            url = "https://auth.openai.com/oauth/token"
+            debug_logger.log_info(f"[RT_TO_AT] 📡 请求 URL: {url}")
+
+            try:
+                response = await session.post(url, **kwargs)
+                debug_logger.log_info(f"[RT_TO_AT] 📥 响应状态码: {response.status_code}")
+
+                if response.status_code != 200:
+                    error_msg = f"Failed to convert RT to AT: {response.status_code}"
+                    debug_logger.log_info(f"[RT_TO_AT] ❌ {error_msg}")
+                    debug_logger.log_info(f"[RT_TO_AT] 响应内容: {response.text[:500]}")
+                    raise ValueError(f"{error_msg} - {response.text}")
+
+                # 获取响应文本用于调试
+                response_text = response.text
+                debug_logger.log_info(f"[RT_TO_AT] 📄 响应内容: {response_text[:500]}")
+
+                # 检查响应是否为空
+                if not response_text or response_text.strip() == "":
+                    debug_logger.log_info(f"[RT_TO_AT] ❌ 响应体为空")
+                    raise ValueError("Response body is empty")
+
+                try:
+                    data = response.json()
+                except Exception as json_err:
+                    debug_logger.log_info(f"[RT_TO_AT] ❌ JSON解析失败: {str(json_err)}")
+                    debug_logger.log_info(f"[RT_TO_AT] 原始响应: {response_text[:1000]}")
+                    raise ValueError(f"Failed to parse JSON response: {str(json_err)}")
+
+                # 检查data是否为None
+                if data is None:
+                    debug_logger.log_info(f"[RT_TO_AT] ❌ 响应JSON为空")
+                    raise ValueError("Response JSON is empty")
+
+                access_token = data.get("access_token")
+                new_refresh_token = data.get("refresh_token")
+                expires_in = data.get("expires_in")
+
+                # 检查必要字段
+                if not access_token:
+                    debug_logger.log_info(f"[RT_TO_AT] ❌ 响应中缺少 access_token 字段")
+                    debug_logger.log_info(f"[RT_TO_AT] 响应数据: {data}")
+                    raise ValueError("Missing access_token in response")
+
+                debug_logger.log_info(f"[RT_TO_AT] ✅ RT 转换成功")
+                debug_logger.log_info(f"  - 新 Access Token 有效期: {expires_in} 秒")
+                debug_logger.log_info(f"  - Refresh Token 已更新: {'是' if new_refresh_token else '否'}")
+
+                return {
+                    "access_token": access_token,
+                    "refresh_token": new_refresh_token,
+                    "expires_in": expires_in
+                }
+            except Exception as e:
+                debug_logger.log_info(f"[RT_TO_AT] 🔴 异常: {str(e)}")
+                raise
+    
+    async def add_token(self, token_value: str,
+                       st: Optional[str] = None,
+                       rt: Optional[str] = None,
+                       client_id: Optional[str] = None,
+                       proxy_url: Optional[str] = None,
+                       remark: Optional[str] = None,
+                       update_if_exists: bool = False,
+                       image_enabled: bool = True,
+                       video_enabled: bool = True,
+                       image_concurrency: int = -1,
+                       video_concurrency: int = -1) -> Token:
+        """Add a new Access Token to database
+
+        Args:
+            token_value: Access Token
+            st: Session Token (optional)
+            rt: Refresh Token (optional)
+            client_id: Client ID (optional)
+            proxy_url: Proxy URL (optional)
+            remark: Remark (optional)
+            update_if_exists: If True, update existing token instead of raising error
+            image_enabled: Enable image generation (default: True)
+            video_enabled: Enable video generation (default: True)
+            image_concurrency: Image concurrency limit (-1 for no limit)
+            video_concurrency: Video concurrency limit (-1 for no limit)
+
+        Returns:
+            Token object
+
+        Raises:
+            ValueError: If token already exists and update_if_exists is False
+        """
+        # Debug log for proxy_url
+        print(f"🔍 add_token called with proxy_url={proxy_url}")
+        
+        # Check if token already exists
+        existing_token = await self.db.get_token_by_value(token_value)
+        if existing_token:
+            if not update_if_exists:
+                raise ValueError(f"Token 已存在（邮箱: {existing_token.email}）。如需更新，请先删除旧 Token 或使用更新功能。")
+            # Update existing token
+            return await self.update_existing_token(existing_token.id, token_value, st, rt, remark, proxy_url)
+
+        # Decode JWT to get expiry time and email
+        decoded = await self.decode_jwt(token_value)
+
+        # Extract expiry time from JWT
+        expiry_time = datetime.fromtimestamp(decoded.get("exp", 0)) if "exp" in decoded else None
+
+        # Extract email from JWT (OpenAI JWT format)
+        jwt_email = None
+        if "https://api.openai.com/profile" in decoded:
+            jwt_email = decoded["https://api.openai.com/profile"].get("email")
+
+        # Get user info from Sora API
+        try:
+            user_info = await self.get_user_info(token_value, proxy_url=proxy_url)
+            email = user_info.get("email", jwt_email or "")
+            name = user_info.get("name") or ""
+        except Exception as e:
+            # If API call fails, use JWT data
+            email = jwt_email or ""
+            name = email.split("@")[0] if email else ""
+
+        # Get subscription info from Sora API
+        plan_type = None
+        plan_title = None
+        subscription_end = None
+        try:
+            sub_info = await self.get_subscription_info(token_value, proxy_url=proxy_url)
+            plan_type = sub_info.get("plan_type")
+            plan_title = sub_info.get("plan_title")
+            # Parse subscription end time
+            if sub_info.get("subscription_end"):
+                from dateutil import parser
+                subscription_end = parser.parse(sub_info["subscription_end"])
+        except Exception as e:
+            error_msg = str(e)
+            # Re-raise if it's a critical error (token expired)
+            if "Token已过期" in error_msg:
+                raise
+            # If API call fails, subscription info will be None
+            print(f"Failed to get subscription info: {e}")
+
+        # Get Sora2 invite code
+        sora2_supported = None
+        sora2_invite_code = None
+        sora2_redeemed_count = 0
+        sora2_total_count = 0
+        sora2_remaining_count = 0
+        try:
+            sora2_info = await self.get_sora2_invite_code(token_value, proxy_url=proxy_url)
+            sora2_supported = sora2_info.get("supported", False)
+            sora2_invite_code = sora2_info.get("invite_code")
+            sora2_redeemed_count = sora2_info.get("redeemed_count", 0)
+            sora2_total_count = sora2_info.get("total_count", 0)
+
+            # If Sora2 is supported, get remaining count
+            if sora2_supported:
+                try:
+                    remaining_info = await self.get_sora2_remaining_count(token_value, proxy_url=proxy_url)
+                    if remaining_info.get("success"):
+                        sora2_remaining_count = remaining_info.get("remaining_count", 0)
+                        print(f"✅ Sora2剩余次数: {sora2_remaining_count}")
+                except Exception as e:
+                    print(f"Failed to get Sora2 remaining count: {e}")
+        except Exception as e:
+            error_msg = str(e)
+            # Re-raise if it's a critical error (unsupported country)
+            if "Sora在您的国家/地区不可用" in error_msg:
+                raise
+            # If API call fails, Sora2 info will be None
+            print(f"Failed to get Sora2 info: {e}")
+
+        # Check and set username if needed
+        try:
+            # Get fresh user info to check username
+            user_info = await self.get_user_info(token_value, proxy_url=proxy_url)
+            username = user_info.get("username")
+
+            # If username is null, need to set one
+            if username is None:
+                print(f"⚠️  检测到用户名为null，需要设置用户名")
+
+                # Generate random username
+                max_attempts = 5
+                for attempt in range(max_attempts):
+                    generated_username = self._generate_random_username()
+                    print(f"🔄 尝试用户名 ({attempt + 1}/{max_attempts}): {generated_username}")
+
+                    # Check if username is available
+                    if await self.check_username_available(token_value, generated_username, proxy_url=proxy_url):
+                        # Set the username
+                        try:
+                            await self.set_username(token_value, generated_username, proxy_url=proxy_url)
+                            print(f"✅ 用户名设置成功: {generated_username}")
+                            break
+                        except Exception as e:
+                            print(f"❌ 用户名设置失败: {e}")
+                            if attempt == max_attempts - 1:
+                                print(f"⚠️  达到最大尝试次数，跳过用户名设置")
+                    else:
+                        print(f"⚠️  用户名 {generated_username} 已被占用，尝试下一个")
+                        if attempt == max_attempts - 1:
+                            print(f"⚠️  达到最大尝试次数，跳过用户名设置")
+            else:
+                print(f"✅ 用户名已设置: {username}")
+        except Exception as e:
+            print(f"⚠️  用户名检查/设置过程中出错: {e}")
+
+        # Create token object
+        print(f"🔍 Creating Token object with proxy_url={proxy_url}")
+        token = Token(
+            token=token_value,
+            email=email,
+            name=name,
+            st=st,
+            rt=rt,
+            client_id=client_id,
+            proxy_url=proxy_url,
+            remark=remark,
+            expiry_time=expiry_time,
+            is_active=True,
+            plan_type=plan_type,
+            plan_title=plan_title,
+            subscription_end=subscription_end,
+            sora2_supported=sora2_supported,
+            sora2_invite_code=sora2_invite_code,
+            sora2_redeemed_count=sora2_redeemed_count,
+            sora2_total_count=sora2_total_count,
+            sora2_remaining_count=sora2_remaining_count,
+            image_enabled=image_enabled,
+            video_enabled=video_enabled,
+            image_concurrency=image_concurrency,
+            video_concurrency=video_concurrency
+        )
+
+        # Save to database
+        print(f"🔍 Saving token to database, token.proxy_url={token.proxy_url}")
+        token_id = await self.db.add_token(token)
+        token.id = token_id
+
+        return token
+
+    async def update_existing_token(self, token_id: int, token_value: str,
+                                    st: Optional[str] = None,
+                                    rt: Optional[str] = None,
+                                    remark: Optional[str] = None,
+                                    proxy_url: Optional[str] = None) -> Token:
+        """Update an existing token with new information"""
+        # Decode JWT to get expiry time
+        decoded = await self.decode_jwt(token_value)
+        expiry_time = datetime.fromtimestamp(decoded.get("exp", 0)) if "exp" in decoded else None
+
+        # Get user info from Sora API
+        jwt_email = None
+        if "https://api.openai.com/profile" in decoded:
+            jwt_email = decoded["https://api.openai.com/profile"].get("email")
+
+        try:
+            user_info = await self.get_user_info(token_value, proxy_url=proxy_url)
+            email = user_info.get("email", jwt_email or "")
+            name = user_info.get("name", "")
+        except Exception as e:
+            email = jwt_email or ""
+            name = email.split("@")[0] if email else ""
+
+        # Get subscription info from Sora API
+        plan_type = None
+        plan_title = None
+        subscription_end = None
+        try:
+            sub_info = await self.get_subscription_info(token_value, proxy_url=proxy_url)
+            plan_type = sub_info.get("plan_type")
+            plan_title = sub_info.get("plan_title")
+            if sub_info.get("subscription_end"):
+                from dateutil import parser
+                subscription_end = parser.parse(sub_info["subscription_end"])
+        except Exception as e:
+            print(f"Failed to get subscription info: {e}")
+
+        # Update token in database
+        await self.db.update_token(
+            token_id=token_id,
+            token=token_value,
+            st=st,
+            rt=rt,
+            remark=remark,
+            expiry_time=expiry_time,
+            plan_type=plan_type,
+            plan_title=plan_title,
+            subscription_end=subscription_end
+        )
+
+        # Get updated token
+        updated_token = await self.db.get_token(token_id)
+        return updated_token
+
     async def delete_token(self, token_id: int):
-        """Delete token"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM token_stats WHERE token_id = ?", (token_id,))
-            await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
-            await db.commit()
+        """Delete a token"""
+        await self.db.delete_token(token_id)
 
     async def update_token(self, token_id: int,
                           token: Optional[str] = None,
@@ -603,469 +920,286 @@ class Database:
                           client_id: Optional[str] = None,
                           proxy_url: Optional[str] = None,
                           remark: Optional[str] = None,
-                          expiry_time: Optional[datetime] = None,
-                          plan_type: Optional[str] = None,
-                          plan_title: Optional[str] = None,
-                          subscription_end: Optional[datetime] = None,
                           image_enabled: Optional[bool] = None,
                           video_enabled: Optional[bool] = None,
                           image_concurrency: Optional[int] = None,
                           video_concurrency: Optional[int] = None):
-        """Update token (AT, ST, RT, client_id, proxy_url, remark, expiry_time, subscription info, image_enabled, video_enabled)"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Build dynamic update query
-            updates = []
-            params = []
+        """Update token (AT, ST, RT, client_id, proxy_url, remark, image_enabled, video_enabled, concurrency limits)"""
+        print(f"🔍 update_token called with token_id={token_id}, proxy_url={proxy_url}")
+        # If token (AT) is updated, decode JWT to get new expiry time
+        expiry_time = None
+        if token:
+            try:
+                decoded = await self.decode_jwt(token)
+                expiry_time = datetime.fromtimestamp(decoded.get("exp", 0)) if "exp" in decoded else None
+            except Exception:
+                pass  # If JWT decode fails, keep expiry_time as None
 
-            if token is not None:
-                updates.append("token = ?")
-                params.append(token)
+        await self.db.update_token(token_id, token=token, st=st, rt=rt, client_id=client_id, proxy_url=proxy_url, remark=remark, expiry_time=expiry_time,
+                                   image_enabled=image_enabled, video_enabled=video_enabled,
+                                   image_concurrency=image_concurrency, video_concurrency=video_concurrency)
 
-            if st is not None:
-                updates.append("st = ?")
-                params.append(st)
-
-            if rt is not None:
-                updates.append("rt = ?")
-                params.append(rt)
-
-            if client_id is not None:
-                updates.append("client_id = ?")
-                params.append(client_id)
-
-            if proxy_url is not None:
-                updates.append("proxy_url = ?")
-                params.append(proxy_url)
-
-            if remark is not None:
-                updates.append("remark = ?")
-                params.append(remark)
-
-            if expiry_time is not None:
-                updates.append("expiry_time = ?")
-                params.append(expiry_time)
-
-            if plan_type is not None:
-                updates.append("plan_type = ?")
-                params.append(plan_type)
-
-            if plan_title is not None:
-                updates.append("plan_title = ?")
-                params.append(plan_title)
-
-            if subscription_end is not None:
-                updates.append("subscription_end = ?")
-                params.append(subscription_end)
-
-            if image_enabled is not None:
-                updates.append("image_enabled = ?")
-                params.append(image_enabled)
-
-            if video_enabled is not None:
-                updates.append("video_enabled = ?")
-                params.append(video_enabled)
-
-            if image_concurrency is not None:
-                updates.append("image_concurrency = ?")
-                params.append(image_concurrency)
-
-            if video_concurrency is not None:
-                updates.append("video_concurrency = ?")
-                params.append(video_concurrency)
-
-            if updates:
-                params.append(token_id)
-                query = f"UPDATE tokens SET {', '.join(updates)} WHERE id = ?"
-                await db.execute(query, params)
-                await db.commit()
-
-    # Token stats operations
-    async def get_token_stats(self, token_id: int) -> Optional[TokenStats]:
-        """Get token statistics"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
-            if row:
-                return TokenStats(**dict(row))
-            return None
+    async def get_active_tokens(self) -> List[Token]:
+        """Get all active tokens (not cooled down)"""
+        return await self.db.get_active_tokens()
     
-    async def increment_image_count(self, token_id: int):
-        """Increment image generation count"""
-        from datetime import date
-        async with aiosqlite.connect(self.db_path) as db:
-            today = str(date.today())
-            # Get current stats
-            cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
-
-            # If date changed, reset today's count
-            if row and row[0] != today:
-                await db.execute("""
-                    UPDATE token_stats
-                    SET image_count = image_count + 1,
-                        today_image_count = 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
-            else:
-                # Same day, just increment both
-                await db.execute("""
-                    UPDATE token_stats
-                    SET image_count = image_count + 1,
-                        today_image_count = today_image_count + 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
-            await db.commit()
-
-    async def increment_video_count(self, token_id: int):
-        """Increment video generation count"""
-        from datetime import date
-        async with aiosqlite.connect(self.db_path) as db:
-            today = str(date.today())
-            # Get current stats
-            cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
-
-            # If date changed, reset today's count
-            if row and row[0] != today:
-                await db.execute("""
-                    UPDATE token_stats
-                    SET video_count = video_count + 1,
-                        today_video_count = 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
-            else:
-                # Same day, just increment both
-                await db.execute("""
-                    UPDATE token_stats
-                    SET video_count = video_count + 1,
-                        today_video_count = today_video_count + 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
-            await db.commit()
+    async def get_all_tokens(self) -> List[Token]:
+        """Get all tokens"""
+        return await self.db.get_all_tokens()
     
-    async def increment_error_count(self, token_id: int, increment_consecutive: bool = True):
-        """Increment error count
+    async def update_token_status(self, token_id: int, is_active: bool):
+        """Update token active status"""
+        await self.db.update_token_status(token_id, is_active)
+
+    async def enable_token(self, token_id: int):
+        """Enable a token and reset error count"""
+        await self.db.update_token_status(token_id, True)
+        # Reset error count when enabling (in token_stats table)
+        await self.db.reset_error_count(token_id)
+
+    async def disable_token(self, token_id: int):
+        """Disable a token"""
+        await self.db.update_token_status(token_id, False)
+
+    async def test_token(self, token_id: int) -> dict:
+        """Test if a token is valid by calling Sora API and refresh Sora2 info"""
+        # Get token from database
+        token_data = await self.db.get_token(token_id)
+        if not token_data:
+            return {"valid": False, "message": "Token not found"}
+
+        try:
+            # Use token's own proxy_url if available, otherwise use global proxy
+            token_proxy_url = token_data.proxy_url if token_data.proxy_url else None
+            
+            # Try to get user info from Sora API
+            user_info = await self.get_user_info(token_data.token, proxy_url=token_proxy_url)
+
+            # Refresh Sora2 invite code and counts
+            sora2_info = await self.get_sora2_invite_code(token_data.token, proxy_url=token_proxy_url)
+            sora2_supported = sora2_info.get("supported", False)
+            sora2_invite_code = sora2_info.get("invite_code")
+            sora2_redeemed_count = sora2_info.get("redeemed_count", 0)
+            sora2_total_count = sora2_info.get("total_count", 0)
+            sora2_remaining_count = 0
+
+            # If Sora2 is supported, get remaining count
+            if sora2_supported:
+                try:
+                    remaining_info = await self.get_sora2_remaining_count(token_data.token, proxy_url=token_proxy_url)
+                    if remaining_info.get("success"):
+                        sora2_remaining_count = remaining_info.get("remaining_count", 0)
+                except Exception as e:
+                    print(f"Failed to get Sora2 remaining count: {e}")
+
+            # Update token Sora2 info in database
+            await self.db.update_token_sora2(
+                token_id,
+                supported=sora2_supported,
+                invite_code=sora2_invite_code,
+                redeemed_count=sora2_redeemed_count,
+                total_count=sora2_total_count,
+                remaining_count=sora2_remaining_count
+            )
+
+            return {
+                "valid": True,
+                "message": "Token is valid",
+                "email": user_info.get("email"),
+                "username": user_info.get("username"),
+                "sora2_supported": sora2_supported,
+                "sora2_invite_code": sora2_invite_code,
+                "sora2_redeemed_count": sora2_redeemed_count,
+                "sora2_total_count": sora2_total_count,
+                "sora2_remaining_count": sora2_remaining_count
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "message": f"Token is invalid: {str(e)}"
+            }
+
+    async def record_usage(self, token_id: int, is_video: bool = False):
+        """Record token usage"""
+        await self.db.update_token_usage(token_id)
+        
+        if is_video:
+            await self.db.increment_video_count(token_id)
+        else:
+            await self.db.increment_image_count(token_id)
+    
+    async def record_error(self, token_id: int, is_overload: bool = False):
+        """Record token error
 
         Args:
             token_id: Token ID
-            increment_consecutive: Whether to increment consecutive error count (False for overload errors)
+            is_overload: Whether this is an overload error (heavy_load). If True, only increment total error count.
         """
-        from datetime import date
-        async with aiosqlite.connect(self.db_path) as db:
-            today = str(date.today())
-            # Get current stats
-            cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
+        await self.db.increment_error_count(token_id, increment_consecutive=not is_overload)
 
-            # If date changed, reset today's error count
-            if row and row[0] != today:
-                if increment_consecutive:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            consecutive_error_count = consecutive_error_count + 1,
-                            today_error_count = 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-                else:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            today_error_count = 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
+        # Check if should ban (only if not overload error)
+        if not is_overload:
+            stats = await self.db.get_token_stats(token_id)
+            admin_config = await self.db.get_admin_config()
+
+            if stats and stats.consecutive_error_count >= admin_config.error_ban_threshold:
+                await self.db.update_token_status(token_id, False)
+    
+    async def record_success(self, token_id: int, is_video: bool = False):
+        """Record successful request (reset error count)"""
+        await self.db.reset_error_count(token_id)
+
+        # Update Sora2 remaining count after video generation
+        if is_video:
+            try:
+                token_data = await self.db.get_token(token_id)
+                if token_data and token_data.sora2_supported:
+                    remaining_info = await self.get_sora2_remaining_count(token_data.token)
+                    if remaining_info.get("success"):
+                        remaining_count = remaining_info.get("remaining_count", 0)
+                        await self.db.update_token_sora2_remaining(token_id, remaining_count)
+                        print(f"✅ 更新Token {token_id} 的Sora2剩余次数: {remaining_count}")
+
+                        # If remaining count is 0, set cooldown
+                        if remaining_count == 0:
+                            reset_seconds = remaining_info.get("access_resets_in_seconds", 0)
+                            if reset_seconds > 0:
+                                cooldown_until = datetime.now() + timedelta(seconds=reset_seconds)
+                                await self.db.update_token_sora2_cooldown(token_id, cooldown_until)
+                                print(f"⏱️ Token {token_id} 剩余次数为0，设置冷却时间至: {cooldown_until}")
+            except Exception as e:
+                print(f"Failed to update Sora2 remaining count: {e}")
+    
+    async def refresh_sora2_remaining_if_cooldown_expired(self, token_id: int):
+        """Refresh Sora2 remaining count if cooldown has expired"""
+        try:
+            token_data = await self.db.get_token(token_id)
+            if not token_data or not token_data.sora2_supported:
+                return
+
+            # Check if Sora2 cooldown has expired
+            if token_data.sora2_cooldown_until and token_data.sora2_cooldown_until <= datetime.now():
+                print(f"🔄 Token {token_id} Sora2冷却已过期，正在刷新剩余次数...")
+
+                try:
+                    remaining_info = await self.get_sora2_remaining_count(token_data.token)
+                    if remaining_info.get("success"):
+                        remaining_count = remaining_info.get("remaining_count", 0)
+                        await self.db.update_token_sora2_remaining(token_id, remaining_count)
+                        # Clear cooldown
+                        await self.db.update_token_sora2_cooldown(token_id, None)
+                        print(f"✅ Token {token_id} Sora2剩余次数已刷新: {remaining_count}")
+                except Exception as e:
+                    print(f"Failed to refresh Sora2 remaining count: {e}")
+        except Exception as e:
+            print(f"Error in refresh_sora2_remaining_if_cooldown_expired: {e}")
+
+    async def auto_refresh_expiring_token(self, token_id: int) -> bool:
+        """
+        Auto refresh token when expiry time is within 24 hours using ST or RT
+
+        Returns:
+            True if refresh successful, False otherwise
+        """
+        try:
+            # 📍 Step 1: 获取Token数据
+            debug_logger.log_info(f"[AUTO_REFRESH] 开始检查Token {token_id}...")
+            token_data = await self.db.get_token(token_id)
+
+            if not token_data:
+                debug_logger.log_info(f"[AUTO_REFRESH] ❌ Token {token_id} 不存在")
+                return False
+
+            # 📍 Step 2: 检查是否有过期时间
+            if not token_data.expiry_time:
+                debug_logger.log_info(f"[AUTO_REFRESH] ⏭️  Token {token_id} 无过期时间，跳过刷新")
+                return False  # No expiry time set
+
+            # 📍 Step 3: 计算剩余时间
+            time_until_expiry = token_data.expiry_time - datetime.now()
+            hours_until_expiry = time_until_expiry.total_seconds() / 3600
+
+            debug_logger.log_info(f"[AUTO_REFRESH] ⏰ Token {token_id} 信息:")
+            debug_logger.log_info(f"  - Email: {token_data.email}")
+            debug_logger.log_info(f"  - 过期时间: {token_data.expiry_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            debug_logger.log_info(f"  - 剩余时间: {hours_until_expiry:.2f} 小时")
+            debug_logger.log_info(f"  - 是否激活: {token_data.is_active}")
+            debug_logger.log_info(f"  - 有ST: {'是' if token_data.st else '否'}")
+            debug_logger.log_info(f"  - 有RT: {'是' if token_data.rt else '否'}")
+
+            # 📍 Step 4: 检查是否需要刷新
+            if hours_until_expiry > 24:
+                debug_logger.log_info(f"[AUTO_REFRESH] ⏭️  Token {token_id} 剩余时间 > 24小时，无需刷新")
+                return False  # Token not expiring soon
+
+            # 📍 Step 5: 触发刷新
+            if hours_until_expiry < 0:
+                debug_logger.log_info(f"[AUTO_REFRESH] 🔴 Token {token_id} 已过期，尝试自动刷新...")
             else:
-                # Same day, just increment counters
-                if increment_consecutive:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            consecutive_error_count = consecutive_error_count + 1,
-                            today_error_count = today_error_count + 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-                else:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            today_error_count = today_error_count + 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-            await db.commit()
-    
-    async def reset_error_count(self, token_id: int):
-        """Reset consecutive error count (keep total error_count)"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE token_stats SET consecutive_error_count = 0 WHERE token_id = ?
-            """, (token_id,))
-            await db.commit()
-    
-    # Task operations
-    async def create_task(self, task: Task) -> int:
-        """Create a new task"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                INSERT INTO tasks (task_id, token_id, model, prompt, status, progress)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (task.task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
-            await db.commit()
-            return cursor.lastrowid
-    
-    async def update_task(self, task_id: str, status: str, progress: float, 
-                         result_urls: Optional[str] = None, error_message: Optional[str] = None):
-        """Update task status"""
-        async with aiosqlite.connect(self.db_path) as db:
-            completed_at = datetime.now() if status in ["completed", "failed"] else None
-            await db.execute("""
-                UPDATE tasks 
-                SET status = ?, progress = ?, result_urls = ?, error_message = ?, completed_at = ?
-                WHERE task_id = ?
-            """, (status, progress, result_urls, error_message, completed_at, task_id))
-            await db.commit()
-    
-    async def get_task(self, task_id: str) -> Optional[Task]:
-        """Get task by ID"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
-            row = await cursor.fetchone()
-            if row:
-                return Task(**dict(row))
-            return None
-    
-    # Request log operations
-    async def log_request(self, log: RequestLog):
-        """Log a request"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO request_logs (token_id, operation, request_body, response_body, status_code, duration)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (log.token_id, log.operation, log.request_body, log.response_body, 
-                  log.status_code, log.duration))
-            await db.commit()
-    
-    async def get_recent_logs(self, limit: int = 100) -> List[dict]:
-        """Get recent logs with token email"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
-                SELECT
-                    rl.id,
-                    rl.token_id,
-                    rl.operation,
-                    rl.request_body,
-                    rl.response_body,
-                    rl.status_code,
-                    rl.duration,
-                    rl.created_at,
-                    t.email as token_email
-                FROM request_logs rl
-                LEFT JOIN tokens t ON rl.token_id = t.id
-                ORDER BY rl.created_at DESC
-                LIMIT ?
-            """, (limit,))
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+                debug_logger.log_info(f"[AUTO_REFRESH] 🟡 Token {token_id} 将在 {hours_until_expiry:.2f} 小时后过期，尝试自动刷新...")
 
-    async def clear_all_logs(self):
-        """Clear all request logs"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM request_logs")
-            await db.commit()
+            # Priority: ST > RT
+            new_at = None
+            new_st = None
+            new_rt = None
+            refresh_method = None
 
-    # Admin config operations
-    async def get_admin_config(self) -> AdminConfig:
-        """Get admin configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM admin_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return AdminConfig(**dict(row))
-            # If no row exists, return a default config with placeholder values
-            # This should not happen in normal operation as _ensure_config_rows should create it
-            return AdminConfig(admin_username="admin", admin_password="admin", api_key="han1234")
-    
-    async def update_admin_config(self, config: AdminConfig):
-        """Update admin configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE admin_config
-                SET admin_username = ?, admin_password = ?, api_key = ?, error_ban_threshold = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (config.admin_username, config.admin_password, config.api_key, config.error_ban_threshold))
-            await db.commit()
-    
-    # Proxy config operations
-    async def get_proxy_config(self) -> ProxyConfig:
-        """Get proxy configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM proxy_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return ProxyConfig(**dict(row))
-            # If no row exists, return a default config
-            # This should not happen in normal operation as _ensure_config_rows should create it
-            return ProxyConfig(proxy_enabled=False)
-    
-    async def update_proxy_config(self, enabled: bool, proxy_url: Optional[str]):
-        """Update proxy configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE proxy_config
-                SET proxy_enabled = ?, proxy_url = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (enabled, proxy_url))
-            await db.commit()
+            # 📍 Step 6: 尝试使用ST刷新
+            if token_data.st:
+                try:
+                    debug_logger.log_info(f"[AUTO_REFRESH] 📝 Token {token_id}: 尝试使用 ST 刷新...")
+                    result = await self.st_to_at(token_data.st)
+                    new_at = result.get("access_token")
+                    new_st = token_data.st  # ST refresh doesn't return new ST, so keep the old one
+                    refresh_method = "ST"
+                    debug_logger.log_info(f"[AUTO_REFRESH] ✅ Token {token_id}: 使用 ST 刷新成功")
+                except Exception as e:
+                    debug_logger.log_info(f"[AUTO_REFRESH] ❌ Token {token_id}: 使用 ST 刷新失败 - {str(e)}")
+                    new_at = None
 
-    # Watermark-free config operations
-    async def get_watermark_free_config(self) -> WatermarkFreeConfig:
-        """Get watermark-free configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM watermark_free_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return WatermarkFreeConfig(**dict(row))
-            # If no row exists, return a default config
-            # This should not happen in normal operation as _ensure_config_rows should create it
-            return WatermarkFreeConfig(watermark_free_enabled=False, parse_method="third_party")
+            # 📍 Step 7: 如果ST失败，尝试使用RT
+            if not new_at and token_data.rt:
+                try:
+                    debug_logger.log_info(f"[AUTO_REFRESH] 📝 Token {token_id}: 尝试使用 RT 刷新...")
+                    result = await self.rt_to_at(token_data.rt, client_id=token_data.client_id)
+                    new_at = result.get("access_token")
+                    new_rt = result.get("refresh_token", token_data.rt)  # RT might be updated
+                    refresh_method = "RT"
+                    debug_logger.log_info(f"[AUTO_REFRESH] ✅ Token {token_id}: 使用 RT 刷新成功")
+                except Exception as e:
+                    debug_logger.log_info(f"[AUTO_REFRESH] ❌ Token {token_id}: 使用 RT 刷新失败 - {str(e)}")
+                    new_at = None
 
-    async def update_watermark_free_config(self, enabled: bool, parse_method: str = None,
-                                          custom_parse_url: str = None, custom_parse_token: str = None):
-        """Update watermark-free configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            if parse_method is None and custom_parse_url is None and custom_parse_token is None:
-                # Only update enabled status
-                await db.execute("""
-                    UPDATE watermark_free_config
-                    SET watermark_free_enabled = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = 1
-                """, (enabled,))
+            # 📍 Step 8: 处理刷新结果
+            if new_at:
+                # 刷新成功: 更新Token
+                debug_logger.log_info(f"[AUTO_REFRESH] 💾 Token {token_id}: 保存新的 Access Token...")
+                await self.update_token(token_id, token=new_at, st=new_st, rt=new_rt)
+
+                # 获取更新后的Token信息
+                updated_token = await self.db.get_token(token_id)
+                new_expiry_time = updated_token.expiry_time
+                new_hours_until_expiry = ((new_expiry_time - datetime.now()).total_seconds() / 3600) if new_expiry_time else -1
+
+                debug_logger.log_info(f"[AUTO_REFRESH] ✅ Token {token_id} 已自动刷新成功")
+                debug_logger.log_info(f"  - 刷新方式: {refresh_method}")
+                debug_logger.log_info(f"  - 新过期时间: {new_expiry_time.strftime('%Y-%m-%d %H:%M:%S') if new_expiry_time else 'N/A'}")
+                debug_logger.log_info(f"  - 新剩余时间: {new_hours_until_expiry:.2f} 小时")
+
+                # 📍 Step 9: 检查刷新后的过期时间
+                if new_hours_until_expiry < 0:
+                    # 刷新后仍然过期，禁用Token
+                    debug_logger.log_info(f"[AUTO_REFRESH] 🔴 Token {token_id}: 刷新后仍然过期（剩余时间: {new_hours_until_expiry:.2f} 小时），已禁用")
+                    await self.disable_token(token_id)
+                    return False
+
+                return True
             else:
-                # Update all fields
-                await db.execute("""
-                    UPDATE watermark_free_config
-                    SET watermark_free_enabled = ?, parse_method = ?, custom_parse_url = ?,
-                        custom_parse_token = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = 1
-                """, (enabled, parse_method or "third_party", custom_parse_url, custom_parse_token))
-            await db.commit()
+                # 刷新失败: 禁用Token
+                debug_logger.log_info(f"[AUTO_REFRESH] 🚫 Token {token_id}: 无法刷新（无有效的 ST 或 RT），已禁用")
+                await self.disable_token(token_id)
+                return False
 
-    # Cache config operations
-    async def get_cache_config(self) -> CacheConfig:
-        """Get cache configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM cache_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return CacheConfig(**dict(row))
-            # If no row exists, return a default config
-            # This should not happen in normal operation as _ensure_config_rows should create it
-            return CacheConfig(cache_enabled=False, cache_timeout=600)
-
-    async def update_cache_config(self, enabled: bool = None, timeout: int = None, base_url: Optional[str] = None):
-        """Update cache configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Get current config first
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM cache_config WHERE id = 1")
-            row = await cursor.fetchone()
-
-            if row:
-                current = dict(row)
-                # Update only provided fields
-                new_enabled = enabled if enabled is not None else current.get("cache_enabled", False)
-                new_timeout = timeout if timeout is not None else current.get("cache_timeout", 600)
-                new_base_url = base_url if base_url is not None else current.get("cache_base_url")
-            else:
-                new_enabled = enabled if enabled is not None else False
-                new_timeout = timeout if timeout is not None else 600
-                new_base_url = base_url
-
-            # Convert empty string to None
-            new_base_url = new_base_url if new_base_url else None
-
-            await db.execute("""
-                UPDATE cache_config
-                SET cache_enabled = ?, cache_timeout = ?, cache_base_url = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (new_enabled, new_timeout, new_base_url))
-            await db.commit()
-
-    # Generation config operations
-    async def get_generation_config(self) -> GenerationConfig:
-        """Get generation configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return GenerationConfig(**dict(row))
-            # If no row exists, return a default config
-            # This should not happen in normal operation as _ensure_config_rows should create it
-            return GenerationConfig(image_timeout=300, video_timeout=3000)
-
-    async def update_generation_config(self, image_timeout: int = None, video_timeout: int = None):
-        """Update generation configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Get current config first
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
-            row = await cursor.fetchone()
-
-            if row:
-                current = dict(row)
-                # Update only provided fields
-                new_image_timeout = image_timeout if image_timeout is not None else current.get("image_timeout", 300)
-                new_video_timeout = video_timeout if video_timeout is not None else current.get("video_timeout", 3000)
-            else:
-                new_image_timeout = image_timeout if image_timeout is not None else 300
-                new_video_timeout = video_timeout if video_timeout is not None else 3000
-
-            await db.execute("""
-                UPDATE generation_config
-                SET image_timeout = ?, video_timeout = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (new_image_timeout, new_video_timeout))
-            await db.commit()
-
-    # Token refresh config operations
-    async def get_token_refresh_config(self) -> TokenRefreshConfig:
-        """Get token refresh configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM token_refresh_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return TokenRefreshConfig(**dict(row))
-            # If no row exists, return a default config
-            # This should not happen in normal operation as _ensure_config_rows should create it
-            return TokenRefreshConfig(at_auto_refresh_enabled=False)
-
-    async def update_token_refresh_config(self, at_auto_refresh_enabled: bool):
-        """Update token refresh configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE token_refresh_config
-                SET at_auto_refresh_enabled = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (at_auto_refresh_enabled,))
-            await db.commit()
-
+        except Exception as e:
+            debug_logger.log_info(f"[AUTO_REFRESH] 🔴 Token {token_id}: 自动刷新异常 - {str(e)}")
+            return False
