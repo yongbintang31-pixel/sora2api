@@ -97,6 +97,7 @@ class ImportTokenItem(BaseModel):
     access_token: str  # Access Token (AT)
     session_token: Optional[str] = None  # Session Token (ST)
     refresh_token: Optional[str] = None  # Refresh Token (RT)
+    proxy_url: Optional[str] = None  # Proxy URL (optional)
     is_active: bool = True  # Active status
     image_enabled: bool = True  # Enable image generation
     video_enabled: bool = True  # Enable video generation
@@ -360,6 +361,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     token=import_item.access_token,
                     st=import_item.session_token,
                     rt=import_item.refresh_token,
+                    proxy_url=import_item.proxy_url,
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
                     image_concurrency=import_item.image_concurrency,
@@ -381,6 +383,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     token_value=import_item.access_token,
                     st=import_item.session_token,
                     rt=import_item.refresh_token,
+                    proxy_url=import_item.proxy_url,
                     update_if_exists=False,
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
