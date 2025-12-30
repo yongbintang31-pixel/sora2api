@@ -703,6 +703,9 @@ class TokenManager:
         Raises:
             ValueError: If token already exists and update_if_exists is False
         """
+        # Debug log for proxy_url
+        print(f"🔍 add_token called with proxy_url={proxy_url}")
+        
         # Check if token already exists
         existing_token = await self.db.get_token_by_value(token_value)
         if existing_token:
@@ -819,6 +822,7 @@ class TokenManager:
             print(f"⚠️  用户名检查/设置过程中出错: {e}")
 
         # Create token object
+        print(f"🔍 Creating Token object with proxy_url={proxy_url}")
         token = Token(
             token=token_value,
             email=email,
@@ -845,6 +849,7 @@ class TokenManager:
         )
 
         # Save to database
+        print(f"🔍 Saving token to database, token.proxy_url={token.proxy_url}")
         token_id = await self.db.add_token(token)
         token.id = token_id
 
@@ -920,6 +925,7 @@ class TokenManager:
                           image_concurrency: Optional[int] = None,
                           video_concurrency: Optional[int] = None):
         """Update token (AT, ST, RT, client_id, proxy_url, remark, image_enabled, video_enabled, concurrency limits)"""
+        print(f"🔍 update_token called with token_id={token_id}, proxy_url={proxy_url}")
         # If token (AT) is updated, decode JWT to get new expiry time
         expiry_time = None
         if token:
